@@ -1,25 +1,10 @@
-"""
-Grok MCP bridge: lets Manus (an MCP client) call Grok through the xAI API.
-
-Tools exposed:
-  - ask_grok(prompt, system?)       plain reasoning / second opinion
-  - ask_grok_live(prompt, system?)  Grok with live web + X (Twitter) search
-
-Env vars:
-  XAI_API_KEY    required  your xAI API key
-  BRIDGE_TOKEN   required  shared secret; Manus sends it as "Authorization: Bearer <token>"
-  GROK_MODEL     optional  default "grok-4.3" (check docs.x.ai for the current name)
-  PORT           optional  default 8000
-
-Run:  python server.py     (MCP endpoint will be at /mcp)
-"""
-
 import os
 import secrets
 
 import httpx
 import uvicorn
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
@@ -28,11 +13,15 @@ BRIDGE_TOKEN = os.environ["BRIDGE_TOKEN"]
 GROK_MODEL = os.environ.get("GROK_MODEL", "grok-4.3")
 XAI_URL = "https://api.x.ai/v1/responses"
 
-mcp = FastMCP("grok-bridge", stateless_http=True, json_response=True)
+mcp = FastMCP(
+    "grok-bridge",
+    stateless_http=True,
+    json_response=True,
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
 
 
 def _extract_text(data: dict) -> str:
-    """Pull the assistant text out of an xAI Responses API payload."""
     if isinstance(data.get("output_text"), str) and data["output_text"]:
         return data["output_text"]
     parts = []
