@@ -1,0 +1,20 @@
+# Render Blueprint: https://render.com/docs/blueprint-spec
+# Deploy with: Render Dashboard -> New -> Blueprint, pointed at this repo.
+services:
+  - type: web
+    name: grok-mcp-bridge
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      # Secrets: set these in the Render dashboard, not in this file.
+      - key: XAI_API_KEY
+        sync: false
+      - key: BRIDGE_TOKEN
+        sync: false
+      # xAI model (matches server.py default).
+      - key: GROK_MODEL
+        value: grok-4.3
+      # server.py binds 0.0.0.0:$PORT; this value is the port Render routes to.
+      - key: PORT
+        value: "8000"

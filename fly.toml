@@ -1,0 +1,33 @@
+# Fly.io config: https://fly.io/docs/reference/configuration/
+# Deploy with: fly launch --no-deploy  (to create the app), then `fly deploy`.
+#
+# Secrets (NOT in this file) must be set before deploy:
+#   fly secrets set XAI_API_KEY=xai-...
+#   fly secrets set BRIDGE_TOKEN="$(openssl rand -hex 32)"
+
+app = "grok-mcp-bridge"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  # Non-secret config. server.py binds 0.0.0.0:$PORT (default 8000).
+  GROK_MODEL = "grok-4.3"
+  PORT = "8000"
+
+[http_service]
+  # Must match the port server.py listens on (PORT above).
+  internal_port = 8000
+  # Terminate TLS at Fly's proxy and redirect plain HTTP to HTTPS.
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/health"
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "10s"
