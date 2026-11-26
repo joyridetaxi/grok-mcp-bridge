@@ -9,8 +9,9 @@ import json
 import logging
 import os
 import time
+import uuid
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ import uvicorn
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 log = logging.getLogger("grok-bridge")
@@ -36,6 +38,17 @@ DEFAULT_TIMEOUT_SECONDS = 120.0
 DEFAULT_OUTPUT_RESERVE_TOKENS = 4_096
 DEFAULT_LIVE_SURCHARGE_USD = 0.01
 MIN_TOKEN_CHARS = 32
+MIN_REQUIRED_TOKEN_CHARS = 16
+
+DEFAULT_MAILBOX_PER_HOUR = 10
+DEFAULT_MAILBOX_PER_DAY = 20
+DEFAULT_MAILBOX_MAX_CHARS = 16_000
+DEFAULT_WEBHOOK_TIMEOUT_SECONDS = 8.0
+DEFAULT_MAILBOX_MAX_WAIT_SECONDS = 25
+DEFAULT_MAILBOX_MAX_ITEMS = 200
+ALLOWED_MESSAGE_KINDS = frozenset({"message", "flush"})
+ALLOWED_REPLY_STATUSES = frozenset({"ok", "pending_owner", "error"})
+WEBHOOK_SOURCE = "claude"
 
 mcp = FastMCP(
     "grok-bridge",
@@ -57,6 +70,14 @@ def _int_env(name: str, default: int) -> int:
     if raw is None or raw.strip() == "":
         return default
     return int(raw)
+
+
+def _optional_env(name: str) -> str:
+    return (os.environ.get(name) or "").strip()
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 class Budget:
@@ -144,6 +165,142 @@ class RateLimiter:
             return True
 
 
+class WindowLimiter:
+    """Rolling hour and calendar-day caps for message_grok_bot."""
+
+    def __init__(self, per_hour: int, per_day: int) -> None:
+        self.per_hour = per_hour
+        self.per_day = per_day
+        self._hits: deque[float] = deque()
+        self._lock = asyncio.Lock()
+
+    async def allow(self) -> tuple[bool, str | None]:
+        if self.per_hour <= 0 or self.per_day <= 0:
+            return False, "hour" if self.per_hour <= 0 else "day"
+        now = time.time()
+        hour_cut = now - 3600.0
+        day_cut = now - 86400.0
+        async with self._lock:
+            while self._hits and self._hits[0] < day_cut:
+                self._hits.popleft()
+            hour_count = sum(1 for ts in self._hits if ts >= hour_cut)
+            if hour_count >= self.per_hour:
+                return False, "hour"
+            if len(self._hits) >= self.per_day:
+                return False, "day"
+            self._hits.append(now)
+            return True, None
+
+
+@dataclass
+class MailboxItem:
+    message_id: str
+    reply: str
+    status: str
+    ts: str
+    acked: bool = False
+
+    def as_public(self) -> dict[str, str]:
+        return {
+            "message_id": self.message_id,
+            "reply": self.reply,
+            "status": self.status,
+            "ts": self.ts,
+        }
+
+
+class Mailbox:
+    """In-memory reply store. Emptied when the process restarts or sleeps."""
+
+    def __init__(self, max_items: int = DEFAULT_MAILBOX_MAX_ITEMS) -> None:
+        self.max_items = max_items
+        self._items: list[MailboxItem] = []
+        self._lock = asyncio.Lock()
+        self._changed = asyncio.Event()
+
+    async def add(self, item: MailboxItem) -> None:
+        async with self._lock:
+            self._items.append(item)
+            self._prune_unlocked()
+        self._changed.set()
+
+    def _prune_unlocked(self) -> None:
+        overflow = len(self._items) - self.max_items
+        if overflow <= 0:
+            return
+        kept: list[MailboxItem] = []
+        dropped = 0
+        for item in self._items:
+            if dropped < overflow and item.acked:
+                dropped += 1
+                continue
+            kept.append(item)
+        if dropped < overflow:
+            kept = kept[overflow - dropped :]
+        self._items = kept
+
+    async def list(
+        self,
+        message_id: str | None = None,
+        since_id: str | None = None,
+        include_acked: bool = False,
+    ) -> list[MailboxItem]:
+        async with self._lock:
+            return self._list_unlocked(message_id, since_id, include_acked)
+
+    def _list_unlocked(
+        self,
+        message_id: str | None,
+        since_id: str | None,
+        include_acked: bool,
+    ) -> list[MailboxItem]:
+        items = self._items
+        if not include_acked:
+            items = [item for item in items if not item.acked]
+        if message_id:
+            items = [item for item in items if item.message_id == message_id]
+        if since_id:
+            start = 0
+            for idx, item in enumerate(self._items):
+                if item.message_id == since_id:
+                    start = idx + 1
+            ids_after = {item.message_id for item in self._items[start:]}
+            items = [item for item in items if item.message_id in ids_after]
+        return list(items)
+
+    async def ack(self, ids: list[str]) -> int:
+        wanted = {item_id for item_id in ids if item_id}
+        if not wanted:
+            return 0
+        count = 0
+        async with self._lock:
+            for item in self._items:
+                if not item.acked and item.message_id in wanted:
+                    item.acked = True
+                    count += 1
+        return count
+
+    async def list_or_wait(
+        self,
+        message_id: str | None,
+        since_id: str | None,
+        include_acked: bool,
+        wait_seconds: float,
+    ) -> list[MailboxItem]:
+        found = await self.list(message_id, since_id, include_acked)
+        if found or wait_seconds <= 0:
+            return found
+        self._changed.clear()
+        found = await self.list(message_id, since_id, include_acked)
+        if found:
+            return found
+        try:
+            await asyncio.wait_for(self._changed.wait(), timeout=wait_seconds)
+        except asyncio.TimeoutError:
+            pass
+        return await self.list(message_id, since_id, include_acked)
+
+
 @dataclass
 class Settings:
     api_key: str
@@ -158,6 +315,22 @@ class Settings:
     output_reserve_tokens: int
     live_surcharge_usd: float
     usage_file: Path
+    webhook_url: str = ""
+    webhook_key: str = ""
+    mailbox_token: str = ""
+    mailbox_per_hour: int = DEFAULT_MAILBOX_PER_HOUR
+    mailbox_per_day: int = DEFAULT_MAILBOX_PER_DAY
+    mailbox_max_chars: int = DEFAULT_MAILBOX_MAX_CHARS
+    webhook_timeout_seconds: float = DEFAULT_WEBHOOK_TIMEOUT_SECONDS
+    mailbox_max_wait_seconds: int = DEFAULT_MAILBOX_MAX_WAIT_SECONDS
+
+    @property
+    def webhook_enabled(self) -> bool:
+        return bool(self.webhook_url and self.webhook_key)
+
+    @property
+    def mailbox_enabled(self) -> bool:
+        return bool(self.mailbox_token)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -167,7 +340,7 @@ class Settings:
             raise RuntimeError("XAI_API_KEY is required")
         if not token:
             raise RuntimeError("BRIDGE_TOKEN is required")
-        if len(token) < 16:
+        if len(token) < MIN_REQUIRED_TOKEN_CHARS:
             raise RuntimeError("BRIDGE_TOKEN must be at least 16 characters")
         if len(token) < MIN_TOKEN_CHARS:
             log.warning(
@@ -175,6 +348,24 @@ class Settings:
                 MIN_TOKEN_CHARS,
             )
         usage = os.environ.get("USAGE_FILE", "/tmp/grok-bridge-usage.json")
+        webhook_url = _optional_env("GROK_BOT_WEBHOOK_URL")
+        webhook_key = _optional_env("GROK_BOT_WEBHOOK_KEY")
+        mailbox_token = _optional_env("MAILBOX_TOKEN")
+        if webhook_url and not webhook_url.startswith(("https://", "http://")):
+            log.warning("GROK_BOT_WEBHOOK_URL is set but is not an http(s) URL; tools stay disabled")
+            webhook_url, webhook_key = "", ""
+        if (webhook_url and not webhook_key) or (webhook_key and not webhook_url):
+            log.warning(
+                "message_grok_bot disabled until both GROK_BOT_WEBHOOK_URL and "
+                "GROK_BOT_WEBHOOK_KEY are set"
+            )
+            webhook_url, webhook_key = "", ""
+        if mailbox_token and len(mailbox_token) < MIN_REQUIRED_TOKEN_CHARS:
+            log.warning("MAILBOX_TOKEN is set but shorter than 16 characters; mailbox disabled")
+            mailbox_token = ""
+        if mailbox_token and mailbox_token == token:
+            log.warning("MAILBOX_TOKEN must be distinct from BRIDGE_TOKEN; mailbox disabled")
+            mailbox_token = ""
         return cls(
             api_key=api_key,
             token=token,
@@ -188,6 +379,18 @@ class Settings:
             output_reserve_tokens=_int_env("OUTPUT_RESERVE_TOKENS", DEFAULT_OUTPUT_RESERVE_TOKENS),
             live_surcharge_usd=_float_env("LIVE_SEARCH_SURCHARGE_USD", DEFAULT_LIVE_SURCHARGE_USD),
             usage_file=Path(usage),
+            webhook_url=webhook_url,
+            webhook_key=webhook_key,
+            mailbox_token=mailbox_token,
+            mailbox_per_hour=_int_env("MAILBOX_MAX_PER_HOUR", DEFAULT_MAILBOX_PER_HOUR),
+            mailbox_per_day=_int_env("MAILBOX_MAX_PER_DAY", DEFAULT_MAILBOX_PER_DAY),
+            mailbox_max_chars=_int_env("MAILBOX_MAX_CHARS", DEFAULT_MAILBOX_MAX_CHARS),
+            webhook_timeout_seconds=_float_env(
+                "MAILBOX_WEBHOOK_TIMEOUT_SECONDS", DEFAULT_WEBHOOK_TIMEOUT_SECONDS
+            ),
+            mailbox_max_wait_seconds=_int_env(
+                "MAILBOX_MAX_WAIT_SECONDS", DEFAULT_MAILBOX_MAX_WAIT_SECONDS
+            ),
         )
 
 
@@ -196,6 +399,8 @@ class State:
     settings: Settings
     budget: Budget
     limiter: RateLimiter
+    mailbox: Mailbox = field(default_factory=Mailbox)
+    mailbox_limiter: WindowLimiter | None = None
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "State":
@@ -203,6 +408,8 @@ class State:
             settings=settings,
             budget=Budget(settings.usage_file, settings.monthly_budget_usd),
             limiter=RateLimiter(settings.rate_limit_per_minute),
+            mailbox=Mailbox(),
+            mailbox_limiter=WindowLimiter(settings.mailbox_per_hour, settings.mailbox_per_day),
         )
 
 
@@ -229,6 +436,8 @@ def authorized(header: str, token: str) -> bool:
     digest = lambda value: hmac.new(
         b"grok-mcp-bridge-auth", value.encode("utf-8"), hashlib.sha256
     ).digest()
+    if not token:
+        return False
     return hmac.compare_digest(digest(provided), digest(token))
 
 
@@ -273,6 +482,58 @@ def _extract_text(data: dict) -> str:
                 if block.get("type") in ("output_text", "text") and block.get("text"):
                     parts.append(block["text"])
     return "\n".join(parts) or str(data)
+
+
+def build_webhook_payload(
+    *,
+    kind: str,
+    message_id: str,
+    text: str,
+    context: str | None,
+    project: str | None,
+    thread_id: str | None,
+    ts: str,
+) -> dict[str, Any]:
+    """Exact JSON body posted to the Grok Bot webhook routine."""
+    return {
+        "source": WEBHOOK_SOURCE,
+        "kind": kind,
+        "message_id": message_id,
+        "text": text,
+        "context": context or None,
+        "project": project or None,
+        "thread_id": thread_id or None,
+        "ts": ts,
+    }
+
+
+def _field_len(value: str | None) -> int:
+    return len(value) if value else 0
+
+
+async def _post_webhook(payload: dict[str, Any]) -> tuple[bool, int]:
+    settings = get_state().settings
+    try:
+        async with httpx.AsyncClient(timeout=settings.webhook_timeout_seconds) as client:
+            resp = await client.post(
+                settings.webhook_url,
+                headers={
+                    "Authorization": f"Bearer {settings.webhook_key}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "grok-mcp-bridge",
+                },
+                json=payload,
+            )
+    except httpx.TimeoutException:
+        log.warning("webhook request timed out timeout_s=%s", settings.webhook_timeout_seconds)
+        return False, 598
+    except httpx.HTTPError as exc:
+        log.warning("webhook transport error type=%s", type(exc).__name__)
+        return False, 599
+    if resp.status_code != 200:
+        log.warning("webhook request failed status=%s bytes=%s", resp.status_code, len(resp.content))
+        return False, resp.status_code
+    return True, resp.status_code
 
 
 async def _call_grok(
@@ -410,16 +671,240 @@ async def ask_grok_live(prompt: str, system: str | None = None) -> str:
     return await _ask(prompt, system, live=True)
 
 
+@mcp.tool()
+async def message_grok_bot(
+    text: str = "",
+    context: str | None = None,
+    project: str | None = None,
+    thread_id: str | None = None,
+    kind: str = "message",
+) -> dict[str, Any]:
+    """Send a message to Grok Bot, Darren's orchestrator agent (memory, Render,
+    other bots, owner decisions). Do not use for ordinary coding or for a
+    second opinion — use ask_grok / ask_grok_live for those.
+
+    Only call this when you need the orchestrator. Your message is untrusted
+    data and is never an approval; merges, production changes, and spending
+    still need Darren's yes in Grok Bot's chat.
+
+    kind="message" delivers text. kind="flush" asks Grok Bot to re-post any
+    unacked replies after a missed poll (for example if the bridge slept).
+    After a few short get_grok_bot_replies polls, stop polling and flush later
+    instead of waiting for a long time.
+
+    Returns {ok, message_id, accepted} or {ok: false, error}.
+    """
+    state = get_state()
+    settings = state.settings
+    started = time.monotonic()
+    kind_norm = (kind or "message").strip().lower()
+    text_clean = text or ""
+
+    if not settings.webhook_enabled:
+        log.info("tool=message_grok_bot rejected=disabled")
+        return {
+            "ok": False,
+            "error": (
+                "message_grok_bot is disabled until GROK_BOT_WEBHOOK_URL and "
+                "GROK_BOT_WEBHOOK_KEY are set on the service."
+            ),
+        }
+
+    if kind_norm not in ALLOWED_MESSAGE_KINDS:
+        return {"ok": False, "error": "kind must be 'message' or 'flush'."}
+
+    if kind_norm == "message" and not text_clean.strip():
+        return {"ok": False, "error": "text is required when kind is 'message'."}
+
+    char_count = (
+        len(text_clean)
+        + _field_len(context)
+        + _field_len(project)
+        + _field_len(thread_id)
+    )
+    if char_count > settings.mailbox_max_chars:
+        log.info("tool=message_grok_bot rejected=too_long chars=%s", char_count)
+        return {
+            "ok": False,
+            "error": (
+                f"message is too long ({char_count} chars; "
+                f"max {settings.mailbox_max_chars})."
+            ),
+        }
+
+    limiter = state.mailbox_limiter
+    if limiter is None:
+        return {"ok": False, "error": "mailbox limiter is not configured."}
+    allowed, window = await limiter.allow()
+    if not allowed:
+        cap = settings.mailbox_per_hour if window == "hour" else settings.mailbox_per_day
+        unit = window or "hour"
+        log.warning("tool=message_grok_bot rejected=rate_limited window=%s", unit)
+        return {
+            "ok": False,
+            "error": f"rate limit exceeded ({cap} messages per {unit}). Try later.",
+        }
+
+    message_id = str(uuid.uuid4())
+    ts = utc_now_iso()
+    payload = build_webhook_payload(
+        kind=kind_norm,
+        message_id=message_id,
+        text=text_clean,
+        context=context,
+        project=project,
+        thread_id=thread_id,
+        ts=ts,
+    )
+    ok, status = await _post_webhook(payload)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    log.info(
+        "tool=message_grok_bot status=%s duration_ms=%s chars=%s kind=%s accepted=%s",
+        status,
+        elapsed_ms,
+        char_count,
+        kind_norm,
+        ok,
+    )
+    if not ok:
+        return {
+            "ok": False,
+            "message_id": message_id,
+            "error": f"webhook did not accept the message (status {status}).",
+        }
+    return {"ok": True, "message_id": message_id, "accepted": True, "kind": kind_norm, "ts": ts}
+
+
+@mcp.tool()
+async def get_grok_bot_replies(
+    message_id: str | None = None,
+    since_id: str | None = None,
+    wait_seconds: int = 0,
+    include_acked: bool = False,
+    ack_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Fetch replies Grok Bot posted back to this bridge. Use after
+    message_grok_bot. wait_seconds may be 0 to 25; after a few short polls
+    with no reply, stop polling and call message_grok_bot(kind="flush") later
+    instead of holding a long wait.
+
+    Optional ack_ids marks those message_id values as delivered so they are
+    not returned again. Returns {ok, replies, pending}.
+    """
+    state = get_state()
+    settings = state.settings
+    started = time.monotonic()
+    if ack_ids:
+        await state.mailbox.ack([item for item in ack_ids if item])
+
+    try:
+        wait = int(wait_seconds or 0)
+    except (TypeError, ValueError):
+        wait = 0
+    wait = max(0, min(wait, settings.mailbox_max_wait_seconds))
+    items = await state.mailbox.list_or_wait(message_id, since_id, include_acked, float(wait))
+    replies = [item.as_public() for item in items]
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    log.info(
+        "tool=get_grok_bot_replies status=200 duration_ms=%s replies=%s wait_s=%s",
+        elapsed_ms,
+        len(replies),
+        wait,
+    )
+    return {"ok": True, "replies": replies, "pending": len(replies) == 0}
+
+
+async def _read_json_object(request: Request) -> tuple[dict[str, Any] | None, JSONResponse | None]:
+    try:
+        data = await request.json()
+    except Exception:
+        return None, JSONResponse({"error": "invalid JSON"}, status_code=400)
+    if not isinstance(data, dict):
+        return None, JSONResponse({"error": "JSON object required"}, status_code=400)
+    return data, None
+
+
+async def _handle_bot_replies(request: Request) -> JSONResponse:
+    if request.method != "POST":
+        return JSONResponse({"error": "method not allowed"}, status_code=405)
+    data, err = await _read_json_object(request)
+    if err is not None:
+        return err
+    assert data is not None
+    message_id = str(data.get("message_id") or "").strip()
+    reply = data.get("reply")
+    if not message_id:
+        return JSONResponse({"error": "message_id is required"}, status_code=400)
+    if not isinstance(reply, str) or not reply:
+        return JSONResponse({"error": "reply is required"}, status_code=400)
+    settings = get_state().settings
+    if len(reply) > settings.mailbox_max_chars:
+        return JSONResponse(
+            {
+                "error": (
+                    f"reply is too long ({len(reply)} chars; "
+                    f"max {settings.mailbox_max_chars})."
+                )
+            },
+            status_code=400,
+        )
+    status = str(data.get("status") or "ok").strip()
+    if status not in ALLOWED_REPLY_STATUSES:
+        return JSONResponse(
+            {"error": "status must be 'ok', 'pending_owner', or 'error'."},
+            status_code=400,
+        )
+    ts = str(data.get("ts") or "").strip() or utc_now_iso()
+    await get_state().mailbox.add(
+        MailboxItem(message_id=message_id, reply=reply, status=status, ts=ts)
+    )
+    log.info("mailbox=reply accepted=true status=%s chars=%s", status, len(reply))
+    return JSONResponse({"ok": True, "message_id": message_id, "status": status, "ts": ts})
+
+
+async def _handle_bot_replies_ack(request: Request) -> JSONResponse:
+    if request.method != "POST":
+        return JSONResponse({"error": "method not allowed"}, status_code=405)
+    data, err = await _read_json_object(request)
+    if err is not None:
+        return err
+    assert data is not None
+    ids: list[str] = []
+    if data.get("message_id"):
+        ids.append(str(data.get("message_id")).strip())
+    raw_ids = data.get("ids")
+    if isinstance(raw_ids, list):
+        ids.extend(str(item).strip() for item in raw_ids if item)
+    acked = await get_state().mailbox.ack(ids)
+    log.info("mailbox=ack acked=%s", acked)
+    return JSONResponse({"ok": True, "acked": acked})
+
+
 class BearerAuth(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
+        path = request.url.path
+        if path.endswith("/") and path != "/":
+            path = path[:-1]
         # /health is open and must not leak model, budget, or rate-limit config.
-        if request.url.path == "/health":
+        if path == "/health":
             return JSONResponse({"ok": True})
+        if path in ("/bot-replies", "/bot-replies/ack"):
+            settings = get_state().settings
+            if not settings.mailbox_enabled:
+                log.info("auth=mailbox_disabled path=%s", path)
+                return JSONResponse({"error": "mailbox disabled"}, status_code=503)
+            header = request.headers.get("authorization", "")
+            if not authorized(header, settings.mailbox_token):
+                log.info("auth=rejected path=%s", path)
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
+            if path == "/bot-replies/ack":
+                return await _handle_bot_replies_ack(request)
+            return await _handle_bot_replies(request)
         header = request.headers.get("authorization", "")
         if not authorized(header, get_state().settings.token):
             log.info("auth=rejected path=%s", request.url.path)
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        if request.url.path == "/status":
+        if path == "/status":
             state = get_state()
             snap = state.budget.snapshot()
             return JSONResponse(

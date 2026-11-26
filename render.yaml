@@ -31,3 +31,17 @@ services:
         value: "16000"
       - key: XAI_TIMEOUT_SECONDS
         value: "120"
+      # Optional two-way mailbox (set in the dashboard, not here). Leave unset to disable.
+      - key: GROK_BOT_WEBHOOK_URL
+        sync: false
+      - key: GROK_BOT_WEBHOOK_KEY
+        sync: false
+      - key: MAILBOX_TOKEN
+        sync: false
+      - key: MAILBOX_MAX_PER_HOUR
+        value: "10"
+      - key: MAILBOX_MAX_PER_DAY
+        value: "20"
+      - key: MAILBOX_MAX_CHARS
+        value: "16000"
+
