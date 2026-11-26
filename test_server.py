@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
@@ -233,3 +236,400 @@ def test_short_token_fails_fast(monkeypatch, tmp_path):
     server.reset_state(None)
     with pytest.raises(RuntimeError, match="at least 16"):
         server.Settings.from_env()
+
+
+
+MAILBOX_TOKEN = "m" * 32
+WEBHOOK_URL = "https://example.test/automations/webhook/test"
+WEBHOOK_KEY = "w" * 32
+
+
+@pytest.fixture
+def mailbox_configured(tmp_path, monkeypatch):
+    monkeypatch.setenv("XAI_API_KEY", "test-xai-key")
+    monkeypatch.setenv("BRIDGE_TOKEN", TOKEN)
+    monkeypatch.setenv("GROK_MODEL", "grok-4.3")
+    monkeypatch.setenv("MONTHLY_BUDGET_USD", "15")
+    monkeypatch.setenv("USAGE_FILE", str(tmp_path / "usage-mailbox.json"))
+    monkeypatch.setenv("GROK_BOT_WEBHOOK_URL", WEBHOOK_URL)
+    monkeypatch.setenv("GROK_BOT_WEBHOOK_KEY", WEBHOOK_KEY)
+    monkeypatch.setenv("MAILBOX_TOKEN", MAILBOX_TOKEN)
+    monkeypatch.setenv("MAILBOX_MAX_PER_HOUR", "10")
+    monkeypatch.setenv("MAILBOX_MAX_PER_DAY", "20")
+    monkeypatch.setenv("MAILBOX_MAX_CHARS", "16000")
+    monkeypatch.setenv("MAILBOX_MAX_WAIT_SECONDS", "25")
+    server.reset_state(server.State.from_settings(server.Settings.from_env()))
+    yield
+    server.reset_state(None)
+
+
+@pytest.fixture
+def mailbox_client(mailbox_configured):
+    with TestClient(_http_app()) as test_client:
+        yield test_client
+
+
+@pytest.mark.asyncio
+async def test_message_grok_bot_disabled_when_env_unset(configured):
+    result = await server.message_grok_bot("need a Render check")
+    assert result["ok"] is False
+    assert "disabled" in result["error"].lower()
+    assert "GROK_BOT_WEBHOOK_URL" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_message_grok_bot_posts_expected_payload(mailbox_configured):
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["authorization"] = request.headers["Authorization"]
+        seen["content_type"] = request.headers["Content-Type"]
+        seen["body"] = json.loads(request.content.decode())
+        return httpx.Response(200, json={"accepted": True})
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+
+    def fake_client(*args, **kwargs):
+        kwargs["transport"] = transport
+        kwargs.setdefault("timeout", 8.0)
+        return real_client(*args, **kwargs)
+
+    with patch("server.httpx.AsyncClient", side_effect=fake_client):
+        result = await server.message_grok_bot(
+            "Need Render status for joyride-web",
+            context="staging autoDeploy is off",
+            project="joyride-web",
+            thread_id="thread-1",
+            kind="message",
+        )
+    assert result["ok"] is True
+    assert result["accepted"] is True
+    assert result["kind"] == "message"
+    assert seen["url"] == WEBHOOK_URL
+    assert seen["authorization"] == f"Bearer {WEBHOOK_KEY}"
+    assert "application/json" in seen["content_type"]
+    body = seen["body"]
+    assert body == {
+        "source": "claude",
+        "kind": "message",
+        "message_id": result["message_id"],
+        "text": "Need Render status for joyride-web",
+        "context": "staging autoDeploy is off",
+        "project": "joyride-web",
+        "thread_id": "thread-1",
+        "ts": result["ts"],
+    }
+    assert body["message_id"] == result["message_id"]
+
+
+@pytest.mark.asyncio
+async def test_message_grok_bot_flush_allows_empty_text(mailbox_configured):
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        assert body["kind"] == "flush"
+        assert body["text"] == ""
+        assert body["context"] is None
+        return httpx.Response(200, json={"ok": True})
+
+    real_client = httpx.AsyncClient
+
+    def fake_client(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(*args, **kwargs)
+
+    with patch("server.httpx.AsyncClient", side_effect=fake_client):
+        result = await server.message_grok_bot(kind="flush")
+    assert result["ok"] is True
+    assert result["kind"] == "flush"
+
+
+@pytest.mark.asyncio
+async def test_message_grok_bot_requires_text_for_message(mailbox_configured):
+    result = await server.message_grok_bot("  ", kind="message")
+    assert result["ok"] is False
+    assert "text is required" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_message_grok_bot_rejects_long_payload(mailbox_configured, monkeypatch, tmp_path):
+    monkeypatch.setenv("MAILBOX_MAX_CHARS", "20")
+    monkeypatch.setenv("USAGE_FILE", str(tmp_path / "usage-mailbox-long.json"))
+    server.reset_state(server.State.from_settings(server.Settings.from_env()))
+    result = await server.message_grok_bot("x" * 21)
+    assert result["ok"] is False
+    assert "too long" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_message_grok_bot_hour_and_day_caps(mailbox_configured, monkeypatch, tmp_path):
+    monkeypatch.setenv("MAILBOX_MAX_PER_HOUR", "2")
+    monkeypatch.setenv("MAILBOX_MAX_PER_DAY", "3")
+    monkeypatch.setenv("USAGE_FILE", str(tmp_path / "usage-mailbox-rl.json"))
+    server.reset_state(server.State.from_settings(server.Settings.from_env()))
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True})
+
+    real_client = httpx.AsyncClient
+
+    def fake_client(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(*args, **kwargs)
+
+    with patch("server.httpx.AsyncClient", side_effect=fake_client):
+        first = await server.message_grok_bot("one")
+        second = await server.message_grok_bot("two")
+        third = await server.message_grok_bot("three")
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert third["ok"] is False
+    assert "per hour" in third["error"]
+
+    # Advance just over an hour so the hour cap resets but the day cap still
+    # counts the earlier calls.
+    limiter = server.get_state().mailbox_limiter
+    for idx, _ts in enumerate(list(limiter._hits)):
+        limiter._hits[idx] -= 3601
+
+    with patch("server.httpx.AsyncClient", side_effect=fake_client):
+        fourth = await server.message_grok_bot("four")
+        fifth = await server.message_grok_bot("five")
+    assert fourth["ok"] is True
+    assert fifth["ok"] is False
+    assert "per day" in fifth["error"]
+
+
+@pytest.mark.asyncio
+async def test_message_grok_bot_webhook_error_is_reported(mailbox_configured):
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="nope")
+
+    real_client = httpx.AsyncClient
+
+    def fake_client(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(*args, **kwargs)
+
+    with patch("server.httpx.AsyncClient", side_effect=fake_client):
+        result = await server.message_grok_bot("hello")
+    assert result["ok"] is False
+    assert "500" in result["error"]
+    assert "message_id" in result
+
+
+def test_bot_replies_requires_mailbox_token_not_bridge_token(mailbox_client):
+    assert mailbox_client.post("/bot-replies").status_code == 401
+    assert mailbox_client.post(
+        "/bot-replies",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        json={"message_id": "m1", "reply": "hi"},
+    ).status_code == 401
+    assert mailbox_client.post(
+        "/bot-replies",
+        headers={"Authorization": "Bearer wrong-mailbox-token-0000000000"},
+        json={"message_id": "m1", "reply": "hi"},
+    ).status_code == 401
+    res = mailbox_client.post(
+        "/bot-replies",
+        headers={"Authorization": f"Bearer {MAILBOX_TOKEN}"},
+        json={"message_id": "m1", "reply": "hello from grok bot", "status": "ok"},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["ok"] is True
+    assert body["message_id"] == "m1"
+    assert body["status"] == "ok"
+    dumped = res.text.lower()
+    assert MAILBOX_TOKEN.lower() not in dumped
+    assert TOKEN.lower() not in dumped
+
+
+def test_bot_replies_disabled_without_token(configured):
+    with TestClient(_http_app()) as client:
+        res = client.post(
+            "/bot-replies",
+            headers={"Authorization": f"Bearer {MAILBOX_TOKEN}"},
+            json={"message_id": "m1", "reply": "hi"},
+        )
+    assert res.status_code == 503
+    assert res.json() == {"error": "mailbox disabled"}
+
+
+def test_mailbox_token_matching_bridge_token_is_disabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("XAI_API_KEY", "test-xai-key")
+    monkeypatch.setenv("BRIDGE_TOKEN", TOKEN)
+    monkeypatch.setenv("MAILBOX_TOKEN", TOKEN)
+    monkeypatch.setenv("USAGE_FILE", str(tmp_path / "usage-same-token.json"))
+    server.reset_state(server.State.from_settings(server.Settings.from_env()))
+    assert server.get_state().settings.mailbox_enabled is False
+    with TestClient(_http_app()) as client:
+        res = client.post(
+            "/bot-replies",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+            json={"message_id": "m1", "reply": "hi"},
+        )
+    assert res.status_code == 503
+    server.reset_state(None)
+
+
+def test_short_mailbox_token_is_disabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("XAI_API_KEY", "test-xai-key")
+    monkeypatch.setenv("BRIDGE_TOKEN", TOKEN)
+    monkeypatch.setenv("MAILBOX_TOKEN", "short")
+    monkeypatch.setenv("USAGE_FILE", str(tmp_path / "usage-short-mail.json"))
+    settings = server.Settings.from_env()
+    assert settings.mailbox_enabled is False
+    server.reset_state(None)
+
+
+def test_bot_replies_validation(mailbox_client):
+    headers = {"Authorization": f"Bearer {MAILBOX_TOKEN}"}
+    assert mailbox_client.get("/bot-replies", headers=headers).status_code == 405
+    assert mailbox_client.post("/bot-replies", headers=headers, json=["x"]).status_code == 400
+    assert mailbox_client.post(
+        "/bot-replies", headers=headers, json={"reply": "hi"}
+    ).status_code == 400
+    assert mailbox_client.post(
+        "/bot-replies", headers=headers, json={"message_id": "m1"}
+    ).status_code == 400
+    assert mailbox_client.post(
+        "/bot-replies",
+        headers=headers,
+        json={"message_id": "m1", "reply": "hi", "status": "nope"},
+    ).status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_get_replies_and_ack(mailbox_client, mailbox_configured):
+    headers = {"Authorization": f"Bearer {MAILBOX_TOKEN}"}
+    posted = mailbox_client.post(
+        "/bot-replies",
+        headers=headers,
+        json={
+            "message_id": "abc-123",
+            "reply": "staging is up",
+            "status": "ok",
+            "ts": "2026-11-26T22:35:00+00:00",
+        },
+    )
+    assert posted.status_code == 200
+    listed = await server.get_grok_bot_replies()
+    assert listed["ok"] is True
+    assert listed["pending"] is False
+    assert listed["replies"] == [
+        {
+            "message_id": "abc-123",
+            "reply": "staging is up",
+            "status": "ok",
+            "ts": "2026-11-26T22:35:00+00:00",
+        }
+    ]
+    filtered = await server.get_grok_bot_replies(message_id="abc-123")
+    assert len(filtered["replies"]) == 1
+    empty = await server.get_grok_bot_replies(message_id="no-such")
+    assert empty["replies"] == []
+    assert empty["pending"] is True
+
+    ack = mailbox_client.post(
+        "/bot-replies/ack",
+        headers=headers,
+        json={"message_id": "abc-123"},
+    )
+    assert ack.status_code == 200
+    assert ack.json() == {"ok": True, "acked": 1}
+    after = await server.get_grok_bot_replies()
+    assert after["replies"] == []
+    assert after["pending"] is True
+    still = await server.get_grok_bot_replies(include_acked=True, message_id="abc-123")
+    assert len(still["replies"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_replies_ack_ids_and_long_poll(mailbox_configured):
+    await server.get_state().mailbox.add(
+        server.MailboxItem(
+            message_id="first",
+            reply="one",
+            status="ok",
+            ts="2026-11-26T22:35:00+00:00",
+        )
+    )
+    listed = await server.get_grok_bot_replies(ack_ids=["first"])
+    # ack happens first, so the already-stored reply is hidden unless include_acked.
+    assert listed["replies"] == []
+
+    async def later_reply():
+        await asyncio.sleep(0.05)
+        await server.get_state().mailbox.add(
+            server.MailboxItem(
+                message_id="second",
+                reply="two",
+                status="pending_owner",
+                ts="2026-11-26T22:36:00+00:00",
+            )
+        )
+
+    task = asyncio.create_task(later_reply())
+    waited = await server.get_grok_bot_replies(wait_seconds=2)
+    await task
+    assert waited["replies"][0]["message_id"] == "second"
+    assert waited["replies"][0]["status"] == "pending_owner"
+
+
+def test_bot_replies_rejects_bridge_token_on_ack(mailbox_client):
+    res = mailbox_client.post(
+        "/bot-replies/ack",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        json={"message_id": "m1"},
+    )
+    assert res.status_code == 401
+
+
+def test_mailbox_token_authorized_is_constant_time():
+    assert server.authorized(f"Bearer {MAILBOX_TOKEN}", MAILBOX_TOKEN)
+    assert server.authorized(f"bearer {MAILBOX_TOKEN}", MAILBOX_TOKEN)
+    assert not server.authorized(f"Bearer {TOKEN}", MAILBOX_TOKEN)
+    assert not server.authorized(f"Bearer {MAILBOX_TOKEN}", TOKEN)
+    assert not server.authorized("", MAILBOX_TOKEN)
+
+
+@pytest.mark.asyncio
+async def test_logs_omit_secrets_and_message_text(mailbox_configured, caplog):
+    caplog.set_level("INFO")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True})
+
+    real_client = httpx.AsyncClient
+
+    def fake_client(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(*args, **kwargs)
+
+    secret_text = "SECRET_PROMPT_SHOULD_NOT_BE_LOGGED"
+    with patch("server.httpx.AsyncClient", side_effect=fake_client):
+        result = await server.message_grok_bot(secret_text, context="SECRET_CONTEXT")
+    assert result["ok"] is True
+
+    with TestClient(_http_app()) as client:
+        client.post(
+            "/bot-replies",
+            headers={"Authorization": f"Bearer {MAILBOX_TOKEN}"},
+            json={
+                "message_id": result["message_id"],
+                "reply": "SECRET_REPLY_SHOULD_NOT_BE_LOGGED",
+                "status": "ok",
+            },
+        )
+
+    dumped = caplog.text
+    assert secret_text not in dumped
+    assert "SECRET_CONTEXT" not in dumped
+    assert "SECRET_REPLY_SHOULD_NOT_BE_LOGGED" not in dumped
+    assert WEBHOOK_KEY not in dumped
+    assert MAILBOX_TOKEN not in dumped
+    assert TOKEN not in dumped
+    assert "test-xai-key" not in dumped
+    assert "Bearer " not in dumped
