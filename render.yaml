@@ -1,5 +1,9 @@
 # Render Blueprint: https://render.com/docs/blueprint-spec
-# Deploy with: Render Dashboard -> New -> Blueprint, pointed at this repo.
+#
+# A service named grok-mcp-bridge already exists in this account
+# (srv-db5l78nlot8c73fbq0q0, https://grok-mcp-bridge-8dgo.onrender.com)
+# with auto-deploy from main. Prefer updating that service over creating a
+# second Blueprint service. Dashboard: set healthCheckPath to /health if empty.
 services:
   - type: web
     name: grok-mcp-bridge
@@ -18,3 +22,12 @@ services:
       # server.py binds 0.0.0.0:$PORT; this value is the port Render routes to.
       - key: PORT
         value: "8000"
+      # Soft monthly spend guard (USD, UTC calendar month). Also set this in the xAI console.
+      - key: MONTHLY_BUDGET_USD
+        value: "15"
+      - key: RATE_LIMIT_PER_MINUTE
+        value: "30"
+      - key: MAX_PROMPT_CHARS
+        value: "16000"
+      - key: XAI_TIMEOUT_SECONDS
+        value: "120"
