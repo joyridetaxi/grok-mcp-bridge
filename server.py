@@ -167,6 +167,8 @@ class Settings:
             raise RuntimeError("XAI_API_KEY is required")
         if not token:
             raise RuntimeError("BRIDGE_TOKEN is required")
+        if len(token) < 16:
+            raise RuntimeError("BRIDGE_TOKEN must be at least 16 characters")
         if len(token) < MIN_TOKEN_CHARS:
             log.warning(
                 "BRIDGE_TOKEN is shorter than the recommended %s characters; consider rotating",
@@ -286,12 +288,23 @@ async def _call_grok(
     if tools:
         body["tools"] = tools
 
-    async with httpx.AsyncClient(timeout=settings.timeout_seconds) as client:
-        resp = await client.post(
-            XAI_URL,
-            headers={"Authorization": f"Bearer {settings.api_key}"},
-            json=body,
+    try:
+        async with httpx.AsyncClient(timeout=settings.timeout_seconds) as client:
+            resp = await client.post(
+                XAI_URL,
+                headers={"Authorization": f"Bearer {settings.api_key}"},
+                json=body,
+            )
+    except httpx.TimeoutException:
+        log.warning("xAI request timed out timeout_s=%s", settings.timeout_seconds)
+        return (
+            f"Grok API error: request timed out after {settings.timeout_seconds:.0f}s.",
+            None,
+            598,
         )
+    except httpx.HTTPError as exc:
+        log.warning("xAI transport error type=%s", type(exc).__name__)
+        return "Grok API error: transport failure.", None, 599
     if resp.status_code != 200:
         log.warning("xAI request failed status=%s bytes=%s", resp.status_code, len(resp.content))
         return f"Grok API error {resp.status_code}", None, resp.status_code
@@ -399,7 +412,14 @@ async def ask_grok_live(prompt: str, system: str | None = None) -> str:
 
 class BearerAuth(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
+        # /health is open and must not leak model, budget, or rate-limit config.
         if request.url.path == "/health":
+            return JSONResponse({"ok": True})
+        header = request.headers.get("authorization", "")
+        if not authorized(header, get_state().settings.token):
+            log.info("auth=rejected path=%s", request.url.path)
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        if request.url.path == "/status":
             state = get_state()
             snap = state.budget.snapshot()
             return JSONResponse(
@@ -410,10 +430,6 @@ class BearerAuth(BaseHTTPMiddleware):
                     "rate_limit_per_minute": state.settings.rate_limit_per_minute,
                 }
             )
-        header = request.headers.get("authorization", "")
-        if not authorized(header, get_state().settings.token):
-            log.info("auth=rejected path=%s", request.url.path)
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
         return await call_next(request)
 
 

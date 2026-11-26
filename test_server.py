@@ -33,6 +33,7 @@ def _http_app() -> Starlette:
         routes=[
             Route("/", dummy),
             Route("/mcp", dummy, methods=["GET", "POST"]),
+            Route("/status", dummy, methods=["GET"]),
         ]
     )
     app.add_middleware(server.BearerAuth)
@@ -64,6 +65,19 @@ def client(configured):
 def test_health_is_open_and_omits_secrets(client):
     res = client.get("/health")
     assert res.status_code == 200
+    assert res.json() == {"ok": True}
+    dumped = res.text.lower()
+    assert "test-xai-key" not in dumped
+    assert TOKEN.lower() not in dumped
+    assert "authorization" not in dumped
+    assert "budget" not in dumped
+    assert "grok-4.3" not in dumped
+
+
+def test_status_requires_auth_and_omits_secrets(client):
+    assert client.get("/status").status_code == 401
+    res = client.get("/status", headers={"Authorization": f"Bearer {TOKEN}"})
+    assert res.status_code == 200
     body = res.json()
     assert body["ok"] is True
     assert body["model"] == "grok-4.3"
@@ -73,7 +87,6 @@ def test_health_is_open_and_omits_secrets(client):
     dumped = res.text.lower()
     assert "test-xai-key" not in dumped
     assert TOKEN.lower() not in dumped
-    assert "authorization" not in dumped
 
 
 def test_root_requires_auth(client):
@@ -211,3 +224,12 @@ async def test_upstream_error_does_not_charge_budget(configured):
     assert result == "Grok API error 500"
     assert server.get_state().budget.snapshot()["spent_usd"] == 0
     assert server.get_state().budget.snapshot()["calls"] == 0
+
+
+def test_short_token_fails_fast(monkeypatch, tmp_path):
+    monkeypatch.setenv("XAI_API_KEY", "test-xai-key")
+    monkeypatch.setenv("BRIDGE_TOKEN", "short")
+    monkeypatch.setenv("USAGE_FILE", str(tmp_path / "usage-short.json"))
+    server.reset_state(None)
+    with pytest.raises(RuntimeError, match="at least 16"):
+        server.Settings.from_env()

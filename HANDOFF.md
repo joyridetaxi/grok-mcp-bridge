@@ -40,5 +40,6 @@ Ask Darren, and wait, before doing any of these:
 - A Render service already exists: `grok-mcp-bridge` (`srv-db5l78nlot8c73fbq0q0`), URL `https://grok-mcp-bridge-8dgo.onrender.com`. Do not create a second one.
 - Auto-deploy is **on** for `main`. Merging this PR will deploy whatever is on the branch. Confirm with Darren before merge.
 - `XAI_API_KEY` and `BRIDGE_TOKEN` are already set on that service (names only; never print values).
+- `/health` is public and returns only `{"ok": true}`. Authenticated `/status` shows spend and caps.
 - Default monthly cap in this app is **$15 USD** (`MONTHLY_BUDGET_USD`). Also set the same cap in the xAI console; the in-process tally can reset if the instance disk is wiped. The console cap is the real hard limit.
 - Never log or commit secrets, prompt text, or response text.

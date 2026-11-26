@@ -1,3 +1,9 @@
+# GitHub Actions only runs files under .github/workflows/.
+# This copy lives in docs/ because the token used to push this branch
+# does not have the `workflow` scope required to add that path.
+# To enable CI: copy this file to .github/workflows/ci.yml and push
+# with an account that has the workflow scope (or add it in the GitHub UI).
+
 name: CI
 
 on:
@@ -5,9 +11,13 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

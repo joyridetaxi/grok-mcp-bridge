@@ -1,6 +1,7 @@
 # Fly.io config: https://fly.io/docs/reference/configuration/
 # Deploy with: fly launch --no-deploy  (to create the app), then `fly deploy`.
 #
+# If this app already exists, do not create a second one. Deploy in place.
 # Secrets (NOT in this file) must be set before deploy:
 #   fly secrets set XAI_API_KEY=xai-...
 #   fly secrets set BRIDGE_TOKEN="$(openssl rand -hex 32)"

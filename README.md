@@ -39,14 +39,15 @@ The server fails fast at startup if `XAI_API_KEY` or `BRIDGE_TOKEN` is missing. 
 | Path | Auth | Purpose |
 | --- | --- | --- |
 | `/mcp` | Bearer token required | The MCP streamable-HTTP endpoint (JSON responses, stateless). This is the URL you register with an MCP client. |
-| `/health` | Open (no auth) | Health check. Returns `ok`, the model name, month-to-date budget totals, and the rate-limit setting. No secrets. |
+| `/health` | Open (no auth) | Liveness check. Returns `{"ok": true}` only (no budget or model). |
+| `/status` | Bearer token required | Model name, spend snapshot, and rate-limit config (no secrets). |
 
 ## Existing Render service
 
 A service named `grok-mcp-bridge` already exists and is live:
 
 - URL: `https://grok-mcp-bridge-8dgo.onrender.com`
-- `/health` currently returns `{"ok": true}` (older image; the richer health body ships when this branch is deployed)
+- `/health` is public and stays `{"ok": true}` only. Use authenticated `/status` for spend and caps.
 - Auto-deploy from `main` is **on**. Merging to `main` will deploy this repo. Do not create a second Blueprint service.
 
 Set `healthCheckPath` to `/health` on that service if it is still empty. `XAI_API_KEY` and `BRIDGE_TOKEN` are already configured there.
